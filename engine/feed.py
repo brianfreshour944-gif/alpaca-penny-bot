@@ -105,7 +105,7 @@ class DataFeed:
             # No websocket stream: fall back to REST polling so the bot
             # still gets real bars without a streaming token.
             self._rest_fallback_enabled = True
-            print("[feed] no PACA_STREAMING_TOKEN set — using REST polling instead.")
+            print("[feed] no streaming token set — using REST polling instead.")
             return
         try:
             async with websockets.connect(

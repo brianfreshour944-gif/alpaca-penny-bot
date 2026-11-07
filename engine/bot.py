@@ -59,8 +59,7 @@ class Bot:
     async def _handle_datastream(self):
         token = self.config.stream_token
         if not token:
-            print("[feed] no stream token set — data stream unavailable "
-                  "(paper-only on trades).")
+            print("[feed] no streaming token — using REST polling instead.")
             return
         try:
             import websockets
