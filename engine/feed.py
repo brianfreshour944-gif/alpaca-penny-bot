@@ -51,44 +51,52 @@ class DataFeed:
             from alpaca_trade_api import REST
             from datetime import datetime, timedelta
 
-            # Market data lives on a separate host from trading.
-            # alpaca-trade-api's REST() defaults to the LIVE data host
-            # (data.alpaca.markets) and ignores base_url for data calls
-            # in some versions — paper keys get 401 there.
+            # ROOT CAUSE (confirmed 2026-11-07 via source inspection):
+            # alpaca_trade_api.REST.data_get() calls get_data_url() which
+            # reads APCA_API_DATA_URL env var, defaulting to
+            # data.alpaca.markets (live). Paper keys get 401 there.
+            # base_url= does NOT affect data calls.
             #
-            # Empirically (2026-11-07, Coolify): paper keys authenticate
-            # against data.alpaca.markets via the REST wrapper's internal
-            # routing, but the plain REST.get_bars() path ignores base_url
-            # and hits the live host → 401. The only reliable fix is to
-            # use the paper data host explicitly for paper mode.
+            # Fix: set APCA_API_DATA_URL env var for paper mode so
+            # get_data_url() returns the sandbox host.
             if self.config.order_mode == "paper":
                 data_base = "https://data.sandbox.alpaca.markets"
             else:
                 data_base = "https://data.alpaca.markets"
             print(f"[feed] REST using {data_base} for {symbol} (mode={self.config.order_mode})")
-            # Use url_override / data endpoint if available; fall back to
-            # base_url. alpaca-trade-api 3.x REST accepts `url` param in
-            # some versions — try it, fall back gracefully.
+
+            import os as _os
+            _prev_data_url = _os.environ.get("APCA_API_DATA_URL")
+            _os.environ["APCA_API_DATA_URL"] = data_base
             try:
                 client = REST(
                     key_id=self.config.api_key,
                     secret_key=self.config.secret_key,
                     base_url=data_base,
-                    url=data_base,
                 )
-            except TypeError:
-                client = REST(
-                    key_id=self.config.api_key,
-                    secret_key=self.config.secret_key,
-                    base_url=data_base,
+            finally:
+                if _prev_data_url is None:
+                    _os.environ.pop("APCA_API_DATA_URL", None)
+                else:
+                    _os.environ["APCA_API_DATA_URL"] = _prev_data_url
+            # Env var must be set during get_bars too (get_data_url
+            # reads it at call time, not construction time).
+            import os as _os2
+            _prev2 = _os2.environ.get("APCA_API_DATA_URL")
+            _os2.environ["APCA_API_DATA_URL"] = data_base
+            try:
+                # Last 5 days of daily bars to get the most recent close
+                bars = client.get_bars(
+                    symbol,
+                    timeframe="1Day",
+                    start=(datetime.utcnow() - timedelta(days=5)).isoformat(),
+                    limit=1,
                 )
-            # Last 5 days of daily bars to get the most recent close
-            bars = client.get_bars(
-                symbol,
-                timeframe="1Day",
-                start=(datetime.utcnow() - timedelta(days=5)).isoformat(),
-                limit=1,
-            )
+            finally:
+                if _prev2 is None:
+                    _os2.environ.pop("APCA_API_DATA_URL", None)
+                else:
+                    _os2.environ["APCA_API_DATA_URL"] = _prev2
             if not bars:
                 print(f"[feed] REST: no bars returned for {symbol}")
                 return False
