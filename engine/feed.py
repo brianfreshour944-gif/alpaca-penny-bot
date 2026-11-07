@@ -51,19 +51,37 @@ class DataFeed:
             from alpaca_trade_api import REST
             from datetime import datetime, timedelta
 
-            # Market data lives on a separate host from trading:
-            #   paper → data.sandbox.alpaca.markets
-            #   live  → data.alpaca.markets
-            # Using the wrong one (or the trading host) returns 401.
+            # Market data lives on a separate host from trading.
+            # alpaca-trade-api's REST() defaults to the LIVE data host
+            # (data.alpaca.markets) and ignores base_url for data calls
+            # in some versions — paper keys get 401 there.
+            #
+            # Empirically (2026-11-07, Coolify): paper keys authenticate
+            # against data.alpaca.markets via the REST wrapper's internal
+            # routing, but the plain REST.get_bars() path ignores base_url
+            # and hits the live host → 401. The only reliable fix is to
+            # use the paper data host explicitly for paper mode.
             if self.config.order_mode == "paper":
                 data_base = "https://data.sandbox.alpaca.markets"
             else:
                 data_base = "https://data.alpaca.markets"
-            client = REST(
-                key_id=self.config.api_key,
-                secret_key=self.config.secret_key,
-                base_url=data_base,
-            )
+            print(f"[feed] REST using {data_base} for {symbol} (mode={self.config.order_mode})")
+            # Use url_override / data endpoint if available; fall back to
+            # base_url. alpaca-trade-api 3.x REST accepts `url` param in
+            # some versions — try it, fall back gracefully.
+            try:
+                client = REST(
+                    key_id=self.config.api_key,
+                    secret_key=self.config.secret_key,
+                    base_url=data_base,
+                    url=data_base,
+                )
+            except TypeError:
+                client = REST(
+                    key_id=self.config.api_key,
+                    secret_key=self.config.secret_key,
+                    base_url=data_base,
+                )
             # Last 5 days of daily bars to get the most recent close
             bars = client.get_bars(
                 symbol,
