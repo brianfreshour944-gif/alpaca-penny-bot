@@ -51,19 +51,17 @@ class DataFeed:
             from alpaca_trade_api import REST
             from datetime import datetime, timedelta
 
-            # ROOT CAUSE (confirmed 2026-11-07 via source inspection):
-            # alpaca_trade_api.REST.data_get() calls get_data_url() which
-            # reads APCA_API_DATA_URL env var, defaulting to
-            # data.alpaca.markets (live). Paper keys get 401 there.
-            # base_url= does NOT affect data calls.
+            # Alpaca Market Data routing:
+            #   data.alpaca.markets        ← LIVE account keys (Basic plan → IEX only)
+            #   data.sandbox.alpaca.markets ← PAPER keys only (no SIP, no IEX, often 401)
             #
-            # Fix: set APCA_API_DATA_URL env var for paper mode so
-            # get_data_url() returns the sandbox host.
-            if self.config.order_mode == "paper":
-                data_base = "https://data.sandbox.alpaca.markets"
-            else:
-                data_base = "https://data.alpaca.markets"
-            print(f"[feed] REST using {data_base} for {symbol} (mode={self.config.order_mode})")
+            # The previous fix used the sandbox host for paper keys, but
+            # sandbox data has NO IEX feed for Basic plan → 401/403.
+            # The correct fix: use LIVE data host for BOTH paper and live
+            # keys (market data auth is separate from trading auth).
+            # Basic plan → must pass feed='iex' or API rejects with 401.
+            data_base = "https://data.alpaca.markets"
+            print(f"[feed] REST using {data_base} for {symbol} (feed=iex, mode={self.config.order_mode})")
 
             import os as _os
             _prev_data_url = _os.environ.get("APCA_API_DATA_URL")
@@ -85,12 +83,14 @@ class DataFeed:
             _prev2 = _os2.environ.get("APCA_API_DATA_URL")
             _os2.environ["APCA_API_DATA_URL"] = data_base
             try:
-                # Last 5 days of daily bars to get the most recent close
+                # Last 5 days of daily bars to get the most recent close.
+                # feed='iex' is required for Basic plan (IEX-only).
                 bars = client.get_bars(
                     symbol,
                     timeframe="1Day",
                     start=(datetime.utcnow() - timedelta(days=5)).isoformat(),
                     limit=1,
+                    feed="iex",
                 )
             finally:
                 if _prev2 is None:
