@@ -104,6 +104,11 @@ async def run_until_server_stop(bot):
         if bot.strategy and bot.feed:
             symbols = ["AAPL", "MSFT", "GOOGL"]  # Default symbols to track
             bot.strategy.update_last_bar(symbols, feed=bot.feed)
+            # No bars available (no stream token): stay idle rather than
+            # trading on synthetic zero-price bars. Re-checked each loop
+            # iteration so bars arriving later resume trading.
+            if not any(bot.feed.last_bar(s) for s in symbols):
+                print("[loop] no bars available (check stream token) — idling, no trading.")
             
         if bot.strategy is None:
             # No strategy wired yet: keep the server alive (idle) until an
@@ -113,30 +118,46 @@ async def run_until_server_stop(bot):
             while not bot._stop_requested:
                 await asyncio.sleep(5)
         
-        # Main trading loop
+        # Main trading loop — exceptions are logged with backoff, never
+        # tight-looped (a bad API response must not crash-loop the container;
+        # Coolify marks it unhealthy after the 30s start period).
+        consecutive_errors = 0
         while not bot._stop_requested:
-            # Get positions from strategy
-            if bot.strategy:
-                pos = bot.strategy.get_strategy_positions() if hasattr(bot.strategy, 'get_strategy_positions') else []
-            else:
-                pos = []
-                
-            if not pos:
-                # Check for entry signals
-                if bot.strategy and bot.feed:
-                    symbols = ["AAPL", "MSFT", "GOOGL"]
-                    bot.strategy.update_last_bar(symbols, feed=bot.feed)
-                    
-                    # Try to enter positions
-                    for symbol in symbols:
-                        if bot.strategy.get_position_size(symbol) == 0:
-                            qty = bot.strategy.enter_one_symbol(symbol)
-                            if qty > 0:
-                                print(f"[loop] placing market buy: symbol={symbol} qty={qty}")
-                                resp = bot.broker.trade([symbol], qty)
-                                if resp:
-                                    print(f"[loop] order placed: {resp}")
-            
+            try:
+                # Get positions from strategy
+                if bot.strategy:
+                    pos = bot.strategy.get_strategy_positions() if hasattr(bot.strategy, 'get_strategy_positions') else []
+                else:
+                    pos = []
+
+                if not pos:
+                    # Check for entry signals
+                    if bot.strategy and bot.feed:
+                        symbols = ["AAPL", "MSFT", "GOOGL"]
+                        # Skip trading entirely when no bars are available —
+                        # update_last_bar would otherwise synthesize close=0.0
+                        # bars and trade on meaningless prices.
+                        if not any(bot.feed.last_bar(s) for s in symbols):
+                            await asyncio.sleep(5)
+                            continue
+                        bot.strategy.update_last_bar(symbols, feed=bot.feed)
+
+                        # Try to enter positions
+                        for symbol in symbols:
+                            if bot.strategy.get_position_size(symbol) == 0:
+                                qty = bot.strategy.enter_one_symbol(symbol)
+                                if qty > 0:
+                                    print(f"[loop] placing market buy: symbol={symbol} qty={qty}")
+                                    resp = bot.broker.trade([symbol], qty)
+                                    if resp:
+                                        print(f"[loop] order placed: {resp}")
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                delay = min(60, 5 * consecutive_errors)
+                print(f"[loop] error #{consecutive_errors} ({type(e).__name__}: {e}) — "
+                      f"backing off {delay}s")
+
             await asyncio.sleep(5)
     finally:
         await bot.stop()

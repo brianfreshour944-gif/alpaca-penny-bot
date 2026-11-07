@@ -28,7 +28,7 @@ class Strategy:
                 bar = feed.last_bar(symbol)
                 if bar:
                     self.set_last_bar(symbol, day=self.bar_date(), ts=bar[1], close=bar[0])
-                    return
+                    continue
             self.set_last_bar(symbol, day=self.bar_date(), ts=self.server_time(), close=0.0)
 
     def bar_date(self):

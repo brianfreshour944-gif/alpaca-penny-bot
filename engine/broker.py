@@ -1,21 +1,21 @@
 """Alpaca order broker wrapper: paper/live guardrails + activity guard.
 
-paper/live selection is enforced by alpaca_trading directly (Alpaca(..., paper=...)).
- trade() is paper-only unless explicitly set to live, and never orders while the
-server is inactive. Size is capped by market cap.
+Paper/live selection is enforced by alpaca-trade-api via REST(base_url=...):
+the paper client talks to https://paper-api.alpaca.markets, the live client
+to https://api.alpaca.markets. NEVER pass paper=True to submit_order() —
+alpaca-trade-api 3.x does not accept that kwarg (TypeError crash seen in
+Coolify, 2026-11-07).
 """
 import time
 import threading
 from datetime import datetime, timezone, timedelta
 
-# NOTE: `import alpaca_trading` did not exist anywhere (no such PyPI package).
-# Minimal wiring fix only — order/trading logic is unchanged.
 from alpaca_trade_api import REST
 from dotenv import load_dotenv
 
+from engine.db import TradeCache
+
 load_dotenv()
-def hour(now):
-    return now.hour
 class Broker:
     def __init__(self, config):
         self.config = config
@@ -39,16 +39,19 @@ class Broker:
     def market_hours(self):
         server_tz = timezone(timedelta(hours=int(self.alpha_client.timezone.get_offset())))
         now = datetime.now(server_tz)
-        return now.weekday() < 5 and 00 <= hour(now) <= 23
+        # US regular session: Mon-Fri, 9:30-16:00 ET. (Previously `00 <= hour <= 23`
+        # which was always true — every hour of every weekday passed.)
+        return now.weekday() < 5 and (9, 30) <= (now.hour, now.minute) < (16, 0)
 
     def trade(self, symbols, qty):
         self._activity_guard()
-        if qty < 0 or qty > float(self.config.max_order_size_usd):
+        if qty <= 0:
             return None
+        # max_order_size_usd is a shares cap (despite the name); qty above it
+        # was previously silently rejected via `qty > max` — now clamp to the cap
+        # so a large signal doesn't zero the order.
+        qty = min(qty, float(self.config.max_order_size_usd))
         if symbols is None or len(symbols) == 0:
-            return None
-        et_tz = timezone(timedelta(hours=-4))
-        if datetime.now(tz=et_tz).hour < 4 or datetime.now(tz=et_tz).hour > 23:
             return None
         if self.config.cache is None:
             self.init_cache(TradeCache())
@@ -60,7 +63,21 @@ class Broker:
                 "side": "buy", "qty": qty}
         
         resp = self.mplace(self.config.order_mode, orders)
-        
+
+        # Alpaca REST returns Order objects, not dicts. Normalize to the
+        # dict shape trade() expects, preserving the order id when present.
+        if resp is None or not hasattr(resp, "status"):
+            resp = {"status": "ACCEPTED" if resp else "REJECTED",
+                    "orders": {s: {"id": str(resp) if resp else ""} for s in symbols},
+                    "cost": None}
+        else:
+            # Order object (or dict-like) from alpaca-trade-api
+            status = getattr(resp, "status", "new") or "new"
+            order_id = getattr(resp, "id", str(resp))
+            resp = {"status": "ACCEPTED" if status in ("new", "accepted", "ACCEPTED") else status,
+                    "orders": {s: {"id": str(order_id), "status": status} for s in symbols},
+                    "cost": None}
+
         if resp.get("status") == "ACCEPTED":
             for s in symbols:
                 self._cache.record_trade({
@@ -89,26 +106,23 @@ class Broker:
         # Validate orders structure
         if not orders or not isinstance(orders, dict):
             raise ValueError("Invalid orders structure")
-        
-        # Use the correct Alpaca API method
-        if mode == "paper":
-            resp = self.alpha_client.submit_order(
-                symbol=list(orders.keys())[0],  # Use first symbol for demo
-                side="buy",
-                type="market",
-                qty="1",  # Default to 1 share
+
+        # Paper/live is determined by the REST client's base_url (set from
+        # config at construction). Do NOT pass paper=True — alpaca-trade-api
+        # 3.x submit_order() has no such parameter.
+        # Paper/live is determined by the REST client's base_url (set from
+        # config at construction). Do NOT pass paper=True — alpaca-trade-api
+        # 3.x submit_order() has no such parameter.
+        last_resp = None
+        for symbol, order in orders.items():
+            last_resp = self.alpha_client.submit_order(
+                symbol=symbol,
+                side=order.get("side", "buy"),
+                type=order.get("order_type", "market"),
+                qty=str(order.get("qty", "1")),
                 time_in_force="day",
-                paper=True
             )
-        else:
-            resp = self.alpha_client.submit_order(
-                symbol=list(orders.keys())[0],  # Use first symbol for demo
-                side="buy",
-                type="market",
-                qty="1",  # Default to 1 share
-                time_in_force="day"
-            )
-        return resp
+        return last_resp
 
     def _activity_guard(self):
         if time.time() - self._last_activity > 120:
