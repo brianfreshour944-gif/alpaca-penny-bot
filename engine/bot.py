@@ -134,6 +134,10 @@ async def run_until_server_stop(bot):
                     # Check for entry signals
                     if bot.strategy and bot.feed:
                         symbols = ["AAPL", "MSFT", "GOOGL"]
+                        # Poll REST for fresh bars (fallback when no stream
+                        # token — the websocket path populates _bars directly).
+                        for s in symbols:
+                            bot.feed.poll_rest_bars(s)
                         # Skip trading entirely when no bars are available —
                         # update_last_bar would otherwise synthesize close=0.0
                         # bars and trade on meaningless prices.

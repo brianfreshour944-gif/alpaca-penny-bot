@@ -20,6 +20,7 @@ class DataFeed:
         self._bars = defaultdict(dict)    # symbol -> {day: (close, ts)}
         self._quotation = defaultdict(lambda: (0, 0))  # symbol -> (last, ts)
         self._live = False
+        self._rest_fallback_enabled = False
 
     # ---- public API consumed by subscribers ----
     def get_daily_bar(self, symbol: str, day: str):
@@ -36,6 +37,48 @@ class DataFeed:
 
     def is_live(self):
         return self._live
+
+    # ---- REST fallback (no streaming token needed) ----
+    def poll_rest_bars(self, symbol: str):
+        """Fetch the latest daily bar via alpaca-trade-api REST and store it.
+
+        Uses the same alpaca_trade_api client credentials as the broker
+        (paper or live via base_url). Returns True if a bar was stored.
+        """
+        if not self._rest_fallback_enabled:
+            return False
+        try:
+            from alpaca_trade_api import REST
+            from datetime import datetime, timedelta
+
+            # Market data lives on data.alpaca.markets, NOT the trading
+            # base_url (paper-api.alpaca.markets 401s for /v2/stocks/bars).
+            data_base = "https://data.alpaca.markets"
+            client = REST(
+                key_id=self.config.api_key,
+                secret_key=self.config.secret_key,
+                base_url=data_base,
+            )
+            # Last 5 days of daily bars to get the most recent close
+            bars = client.get_bars(
+                symbol,
+                timeframe="1Day",
+                start=(datetime.utcnow() - timedelta(days=5)).isoformat(),
+                limit=1,
+            )
+            if not bars:
+                print(f"[feed] REST: no bars returned for {symbol}")
+                return False
+            bar = bars[-1] if isinstance(bars, list) else bars
+            close = float(bar.c if hasattr(bar, "c") else bar["c"])
+            ts = float(bar.t.timestamp() if hasattr(bar.t, "timestamp") else bar["t"])
+            day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
+            self._bars[symbol][day] = (round(close, 4), ts)
+            self._quotation[symbol] = (round(close, 4), ts)
+            return True
+        except Exception as e:
+            print(f"[feed] REST poll failed for {symbol}: {type(e).__name__}: {e}")
+            return False
 
     # ---- async entry points ----
     async def set_last_bar(self, symbol: str, day: str, close: float, ts: float):
@@ -54,7 +97,10 @@ class DataFeed:
 
     async def connect(self) -> None:
         if not self.config.stream_token:
-            print("[feed] no PACA_STREAMING_TOKEN set — data stream unavailable (paper OK, paper-only on trades).")
+            # No websocket stream: fall back to REST polling so the bot
+            # still gets real bars without a streaming token.
+            self._rest_fallback_enabled = True
+            print("[feed] no PACA_STREAMING_TOKEN set — using REST polling instead.")
             return
         try:
             async with websockets.connect(
