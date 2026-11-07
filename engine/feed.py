@@ -51,9 +51,14 @@ class DataFeed:
             from alpaca_trade_api import REST
             from datetime import datetime, timedelta
 
-            # Market data lives on data.alpaca.markets, NOT the trading
-            # base_url (paper-api.alpaca.markets 401s for /v2/stocks/bars).
-            data_base = "https://data.alpaca.markets"
+            # Market data lives on a separate host from trading:
+            #   paper → data.sandbox.alpaca.markets
+            #   live  → data.alpaca.markets
+            # Using the wrong one (or the trading host) returns 401.
+            if self.config.order_mode == "paper":
+                data_base = "https://data.sandbox.alpaca.markets"
+            else:
+                data_base = "https://data.alpaca.markets"
             client = REST(
                 key_id=self.config.api_key,
                 secret_key=self.config.secret_key,
