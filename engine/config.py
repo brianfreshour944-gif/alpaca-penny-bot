@@ -65,6 +65,15 @@ class BotConfig:
         # Mirror to PACA_* for any legacy code expecting those names.
         os.environ.setdefault("PACA_API_KEY", config.api_key)
         os.environ.setdefault("PACA_SECRET_KEY", config.secret_key)
+        # Strip whitespace (Coolify UI sometimes preserves trailing newline).
+        config.api_key = config.api_key.strip()
+        config.secret_key = config.secret_key.strip()
+        # Diagnostic: log key fingerprints (first/last 4 chars, length) so
+        # mismatches are visible in Coolify logs without exposing secrets.
+        print(f"[config] key_id={config.api_key[:4]}...{config.api_key[-4:]} "
+              f"(len={len(config.api_key)}) "
+              f"secret=...{config.secret_key[-4:]} (len={len(config.secret_key)}) "
+              f"mode={config.order_mode} base_url={config.base_url}")
         return config
 
 
