@@ -13,7 +13,7 @@ Design:
 import asyncio
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import websockets
 
@@ -74,7 +74,7 @@ class DataFeed:
                 bars = client.get_bars(
                     symbol,
                     timeframe="1Day",
-                    start=(datetime.utcnow() - timedelta(days=days)).isoformat(),
+                    start=(datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
                     limit=days,
                     feed="iex",
                 )
