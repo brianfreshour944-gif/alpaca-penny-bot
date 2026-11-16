@@ -30,7 +30,7 @@ def _install_rest_stub():
     mod = types.ModuleType("alpaca_trade_api")
 
     class FakeREST:
-        instances = []
+        instances: list = []  # noqa: RUF012
 
         def __init__(self, key_id=None, secret_key=None, base_url=None):
             self.key_id, self.secret_key, self.base_url = key_id, secret_key, base_url
@@ -86,8 +86,11 @@ _BARS = {
 
 
 def test_buy_then_sell_flow():
-    FakeREST = _install_rest_stub()
     from engine.bot import Bot
+    _install_rest_stub()
+    _install_rest_stub()
+    _install_rest_stub()
+    _install_rest_stub()
     from engine.config import BotConfig
 
     cfg = BotConfig(api_key="fake_key", secret_key="fake_secret",
@@ -151,7 +154,6 @@ def test_buy_then_sell_flow():
 
 
 def test_market_hours_gate_blocks_trading():
-    FakeREST = _install_rest_stub()
     from engine.bot import Bot
     from engine.config import BotConfig
 
@@ -162,11 +164,10 @@ def test_market_hours_gate_blocks_trading():
     bot.broker.client.get_clock = lambda: _FakeClock() if False else type("C", (), {"is_open": False})()
     s = bot.iteration()
     assert s["entries"] == [] and s["exits"] == []
-    assert FakeREST.instances[-1].submitted == [], "no orders outside market hours"
+    assert bot.broker.client.submitted == [], "no orders outside market hours"
 
 
 def test_position_sync_pulls_alpaca_state():
-    FakeREST = _install_rest_stub()
     from engine.bot import Bot
     from engine.config import BotConfig
 
@@ -187,7 +188,6 @@ def test_position_sync_pulls_alpaca_state():
 
 
 def test_entry_gate_needs_sma():
-    FakeREST = _install_rest_stub()
     from engine.bot import Bot
     from engine.config import BotConfig
 

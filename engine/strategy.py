@@ -74,7 +74,7 @@ class Strategy:
         if not close or close <= 0:
             return 1
         budget = float(getattr(self.config, "max_order_size_usd", 25.0))
-        qty = int(math.floor(budget / close))
+        qty = math.floor(budget / close)
         return max(1, min(qty, cap))
 
     def next_order_qty(self, symbol: str, qty: int):

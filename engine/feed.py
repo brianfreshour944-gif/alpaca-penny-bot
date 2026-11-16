@@ -133,7 +133,7 @@ class DataFeed:
             return
         if stream in ("trade_updates", "status_updates"):
             return
-        if stream.startswith("b.") or stream.startswith("t.") or stream.startswith("q."):
+        if stream.startswith(("b.", "t.", "q.")):
             symbol = data.get("S")
             if not symbol:
                 return
@@ -157,5 +157,5 @@ class DataFeed:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
