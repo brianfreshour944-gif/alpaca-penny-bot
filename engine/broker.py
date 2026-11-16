@@ -106,7 +106,11 @@ class Broker:
         else:
             status = getattr(resp, "status", "new") or "new"
             order_id = getattr(resp, "id", str(resp))
-            resp = {"status": "ACCEPTED" if str(status).lower() in ("new", "accepted") else status,
+            # 'pending_new' is a valid accepted state (order queued at the
+            # exchange); treating it as failure caused duplicate orders.
+            accepted = str(status).lower() in (
+                "new", "accepted", "pending_new", "pending_replace")
+            resp = {"status": "ACCEPTED" if accepted else status,
                     "side": side,
                     "orders": {s: {"id": str(order_id), "status": status} for s in symbols},
                     "cost": None}
