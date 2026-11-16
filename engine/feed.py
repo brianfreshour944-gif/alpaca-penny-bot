@@ -1,17 +1,26 @@
-"""Async Alpaca data feed: daily bars + live quote updates.
+"""Alpaca data feed: daily bars (REST) + live trades/quotes (websocket).
 
-Two independent consumers subscribe to bars/quotes on demand:
-
-    bars  : get_daily_bar / last_bar(symbol)       -> latest close/timestamp per day
-    ticks : get_quotation(symbol, "last") / "size" -> realtime last size/timestamp (no auth)
-
-No pub/sub event callbacks; state is read via the getters above.
+Design:
+  - REST polling: always enabled; fetches the last N daily bars per symbol
+    (enough for SMA(20)). Uses the LIVE data host with feed='iex' — market
+    data auth is separate from trading auth, and Basic plans have no SIP.
+  - Websocket: runs as a fire-and-forget asyncio task (connect() returns
+    immediately; a previous version awaited the stream inline inside connect()
+    and blocked the whole bot). Parses Alpaca's real format
+    {"stream": "...", "data": {...}} — the old parser expected keys
+    ("u", "t", "a", ...) that do not exist in Alpaca's stream.
 """
+import asyncio
+import json
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import websockets
 
 from engine.config import BotConfig
+
+DATA_HOST = "https://data.alpaca.markets"
+STREAM_HOST = "wss://stream.data.alpaca.markets/v2/iex"
 
 
 class DataFeed:
@@ -20,17 +29,20 @@ class DataFeed:
         self._bars = defaultdict(dict)    # symbol -> {day: (close, ts)}
         self._quotation = defaultdict(lambda: (0, 0))  # symbol -> (last, ts)
         self._live = False
-        self._rest_fallback_enabled = False
 
-    # ---- public API consumed by subscribers ----
+    # ---- public API consumed by the strategy ----
     def get_daily_bar(self, symbol: str, day: str):
         return self._bars[symbol].get(day)
 
     def last_bar(self, symbol: str):
         return list(self._bars[symbol].values())[-1] if self._bars[symbol] else None
 
+    def get_bars(self, symbol: str):
+        """Full day->(close, ts) history for the symbol (copy)."""
+        return dict(self._bars.get(symbol, {}))
+
     def get_quotation(self, symbol: str):
-        return dict(self._quotation[symbol])
+        return dict(zip(("last", "ts"), self._quotation[symbol]))
 
     def set_live(self, value: bool):
         self._live = value
@@ -39,132 +51,111 @@ class DataFeed:
         return self._live
 
     # ---- REST fallback (no streaming token needed) ----
-    def poll_rest_bars(self, symbol: str):
-        """Fetch the latest daily bar via alpaca-trade-api REST and store it.
+    def poll_rest_bars(self, symbol: str, days: int = 40):
+        """Fetch recent daily bars via alpaca-trade-api REST and store them.
 
-        Uses the same alpaca_trade_api client credentials as the broker
-        (paper or live via base_url). Returns True if a bar was stored.
+        Uses the LIVE data host for BOTH paper and live keys (market data auth
+        is separate from trading auth; sandbox data has no IEX feed for Basic
+        plans). feed='iex' is required for Basic plans.
         """
-        if not self._rest_fallback_enabled:
-            return False
         try:
-            from alpaca_trade_api import REST
-            from datetime import datetime, timedelta
-
-            # Alpaca Market Data routing:
-            #   data.alpaca.markets        ← LIVE account keys (Basic plan → IEX only)
-            #   data.sandbox.alpaca.markets ← PAPER keys only (no SIP, no IEX, often 401)
-            #
-            # The previous fix used the sandbox host for paper keys, but
-            # sandbox data has NO IEX feed for Basic plan → 401/403.
-            # The correct fix: use LIVE data host for BOTH paper and live
-            # keys (market data auth is separate from trading auth).
-            # Basic plan → must pass feed='iex' or API rejects with 401.
-            data_base = "https://data.alpaca.markets"
-            print(f"[feed] REST using {data_base} for {symbol} (feed=iex, mode={self.config.order_mode})")
-
             import os as _os
-            _prev_data_url = _os.environ.get("APCA_API_DATA_URL")
-            _os.environ["APCA_API_DATA_URL"] = data_base
+
+            from alpaca_trade_api import REST
+
+            _prev = _os.environ.get("APCA_API_DATA_URL")
+            _os.environ["APCA_API_DATA_URL"] = DATA_HOST
             try:
                 client = REST(
                     key_id=self.config.api_key,
                     secret_key=self.config.secret_key,
-                    base_url=data_base,
+                    base_url=DATA_HOST,
                 )
-            finally:
-                if _prev_data_url is None:
-                    _os.environ.pop("APCA_API_DATA_URL", None)
-                else:
-                    _os.environ["APCA_API_DATA_URL"] = _prev_data_url
-            # Env var must be set during get_bars too (get_data_url
-            # reads it at call time, not construction time).
-            import os as _os2
-            _prev2 = _os2.environ.get("APCA_API_DATA_URL")
-            _os2.environ["APCA_API_DATA_URL"] = data_base
-            try:
-                # Last 5 days of daily bars to get the most recent close.
-                # feed='iex' is required for Basic plan (IEX-only).
                 bars = client.get_bars(
                     symbol,
                     timeframe="1Day",
-                    start=(datetime.utcnow() - timedelta(days=5)).isoformat(),
-                    limit=1,
+                    start=(datetime.utcnow() - timedelta(days=days)).isoformat(),
+                    limit=days,
                     feed="iex",
                 )
             finally:
-                if _prev2 is None:
-                    _os2.environ.pop("APCA_API_DATA_URL", None)
+                if _prev is None:
+                    _os.environ.pop("APCA_API_DATA_URL", None)
                 else:
-                    _os2.environ["APCA_API_DATA_URL"] = _prev2
+                    _os.environ["APCA_API_DATA_URL"] = _prev
             if not bars:
-                print(f"[feed] REST: no bars returned for {symbol}")
                 return False
-            bar = bars[-1] if isinstance(bars, list) else bars
-            close = float(bar.c if hasattr(bar, "c") else bar["c"])
-            ts = float(bar.t.timestamp() if hasattr(bar.t, "timestamp") else bar["t"])
-            day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
-            self._bars[symbol][day] = (round(close, 4), ts)
-            self._quotation[symbol] = (round(close, 4), ts)
+            for bar in bars:
+                close = float(bar.c if hasattr(bar, "c") else bar["c"])
+                ts = float(bar.t.timestamp() if hasattr(bar.t, "timestamp") else bar.t)
+                day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
+                self._bars[symbol][day] = (round(close, 4), ts)
+            self._quotation[symbol] = self._bars[symbol][day]
             return True
         except Exception as e:
             print(f"[feed] REST poll failed for {symbol}: {type(e).__name__}: {e}")
             return False
 
-    # ---- async entry points ----
-    async def set_last_bar(self, symbol: str, day: str, close: float, ts: float):
-        self._bars[symbol][day] = (round(close, 4), ts)
-
-    async def set_bid(self, symbol: str, bid: float) -> None:
-        q = self._quotation[symbol]
-        self._quotation[symbol] = (bid, q[1])
-
-    async def set_ask(self, symbol: str, ask: float) -> None:
-        q = self._quotation[symbol]
-        self._quotation[symbol] = (q[0], ask)
-
-    async def on_quote(self, symbol: str) -> None:
-        self._quotation[symbol] = dict(self._quotation[symbol])
-
+    # ---- websocket (fire-and-forget task) ----
     async def connect(self) -> None:
+        """Start the stream consumer as a background task; returns immediately."""
         if not self.config.stream_token:
-            # No websocket stream: fall back to REST polling so the bot
-            # still gets real bars without a streaming token.
-            self._rest_fallback_enabled = True
-            print("[feed] no streaming token set — using REST polling instead.")
+            print("[feed] no streaming token set — using REST polling only.")
             return
-        try:
-            async with websockets.connect(
-                "wss://data.stream.alpaca.markets",
-                open_timeout=30,
-                close_timeout=10,
-            ) as ws:
-                await self._handle_data(ws)
-                self._live = True
-        except Exception as e:
-            print(f"[feed] stream connect failed: {e}")
+        self._stream_task = asyncio.ensure_future(self._stream_loop())
+        print("[feed] websocket task started (iex stream).")
 
-    async def _handle_data(self, ws):
-        import json
-
-        async for raw in ws:
+    async def _stream_loop(self):
+        auth = {"action": "auth", "key": self.config.api_key, "secret": self.config.stream_token}
+        sub = {"action": "subscribe", "trades": [], "quotes": [], "bars": ["*"]}
+        while True:
             try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            if not d.get("u") or "t" not in d:
-                continue
-            tag = d["t"][0]
-            tid = d["t"][1]
-            ts = d["ts"] / 1000
-            s = d["a"]["symbols"][0]["s"]
-            if tag == "T":  # trade
-                bid = float(d["b"][0]["bidPx"]) if d["b"] else self._quotation[s][0]
-                ask = float(d["a"][0]["askPx"]) if d["a"] else self._quotation[s][1]
-                # set_bid/skip
-                await self.set_bid(s, bid)
-                await self.set_ask(s, ask)
-            elif tag == "c":  # quote (skip — set_bid handles last)
-                pass
-            elif tag == "b":  # correction (ignore)
+                async with websockets.connect(STREAM_HOST, open_timeout=30, close_timeout=10) as ws:
+                    await ws.send(json.dumps(auth))
+                    await ws.send(json.dumps(sub))
+                    self._live = True
+                    async for raw in ws:
+                        self._on_message(raw)
+            except Exception as e:
+                print(f"[feed] stream error: {type(e).__name__}: {e} — reconnecting in 10s")
+            self._live = False
+            await asyncio.sleep(10)
+
+    def _on_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        stream = msg.get("stream", "")
+        data = msg.get("data", {})
+        if stream == "error":
+            print(f"[feed] stream error message: {data}")
+            return
+        if stream in ("trade_updates", "status_updates"):
+            return
+        if stream.startswith("b.") or stream.startswith("t.") or stream.startswith("q."):
+            symbol = data.get("S")
+            if not symbol:
+                return
+            if stream.startswith("b."):  # bar: {S, o, h, l, c, v, t}
+                ts = float(data.get("t", 0)) / 1000.0
+                day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
+                self._bars[symbol][day] = (round(float(data.get("c", 0)), 4), ts)
+                self._quotation[symbol] = (round(float(data.get("c", 0)), 4), ts)
+            elif stream.startswith("t."):  # trade: {S, p, t}
+                px, ts = float(data.get("p", 0)), float(data.get("t", 0)) / 1000.0
+                self._quotation[symbol] = (px, ts)
+            elif stream.startswith("q."):  # quote: {S, bp, ap}
+                self._quotation[symbol] = (
+                    float(data.get("ap", 0) or self._quotation[symbol][0]),
+                    float(data.get("t", 0)) / 1000.0,
+                )
+
+    async def stop(self):
+        task = getattr(self, "_stream_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
                 pass

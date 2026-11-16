@@ -4,7 +4,7 @@ Paper by default. LIVE requires an explicit flag and is never assumed.
 Secrets MUST be pasted by the user into .env (never committed; .env is gitignored).
 """
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 try:
     from dotenv import load_dotenv
@@ -24,6 +24,11 @@ class BotConfig:
     stream_token: str = ""
     order_mode: str = "paper"
     max_order_size_usd: float = 25.0
+    # Strategy/risk parameters (defaults keep the bot conservative).
+    stop_loss_pct: float = 0.08
+    take_profit_pct: float = 0.15
+    max_position_qty: int = 1000
+    watchlist: list = field(default_factory=list)
 
     @classmethod
     def load(cls, dotenv_path: str = ".env", **kwargs) -> "BotConfig":
@@ -31,8 +36,6 @@ class BotConfig:
         load_dotenv(dotenv_path, override=False)
 
         # Accept both naming conventions: ALPACA_* (standard) and PACA_* (legacy).
-        # This fixes the Coolify mismatch where vars were set as ALPACA_* but
-        # code only looked for PACA_* (empty string → RuntimeError).
         api_key = os.getenv("ALPACA_API_KEY") or os.getenv("PACA_API_KEY", "")
         secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("PACA_SECRET_KEY", "")
         base_url = (
@@ -44,6 +47,11 @@ class BotConfig:
             os.getenv("ALPACA_STREAMING_TOKEN")
             or os.getenv("PACA_STREAMING_TOKEN", "")
         )
+        watchlist = [
+            s.strip().upper()
+            for s in os.getenv("WATCHLIST", "").split(",")
+            if s.strip()
+        ]
 
         config = cls(
             api_key=api_key,
@@ -52,6 +60,10 @@ class BotConfig:
             stream_token=stream_token,
             order_mode=os.getenv("DEFAULT_ORDER_MODE", "paper"),
             max_order_size_usd=float(os.getenv("MAX_ORDER_SIZE_USD", "25.00")),
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.08")),
+            take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.15")),
+            max_position_qty=int(os.getenv("MAX_POSITION_QTY", "1000")),
+            watchlist=watchlist,
         )
         if not config.api_key or not config.secret_key:
             raise RuntimeError(

@@ -1,4 +1,4 @@
-"""Alpaca order broker wrapper: paper/live guardrails + activity guard.
+"""Alpaca order broker wrapper: buy/sell, position sync, paper/live guardrails.
 
 Paper/live selection is enforced by alpaca-trade-api via REST(base_url=...):
 the paper client talks to https://paper-api.alpaca.markets, the live client
@@ -6,9 +6,8 @@ to https://api.alpaca.markets. NEVER pass paper=True to submit_order() —
 alpaca-trade-api 3.x does not accept that kwarg (TypeError crash seen in
 Coolify, 2026-11-07).
 """
-import time
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 from alpaca_trade_api import REST
 from dotenv import load_dotenv
@@ -16,18 +15,18 @@ from dotenv import load_dotenv
 from engine.db import TradeCache
 
 load_dotenv()
+
+
 class Broker:
     def __init__(self, config):
         self.config = config
         self.config.cache = None
-        self.alpha_client = REST(
+        self.client = REST(
             key_id=config.api_key,
             secret_key=config.secret_key,
             base_url=config.base_url,
         )
         self._cache = None
-        self._last_activity = time.time()
-        self._start_time = time.time()
         self._lock = threading.Lock()
 
     def init_cache(self, cache):
@@ -36,45 +35,79 @@ class Broker:
             self.config.cache = cache
         return cache
 
+    # ---- market clock ----
     def market_hours(self):
-        server_tz = timezone(timedelta(hours=int(self.alpha_client.timezone.get_offset())))
-        now = datetime.now(server_tz)
-        # US regular session: Mon-Fri, 9:30-16:00 ET. (Previously `00 <= hour <= 23`
-        # which was always true — every hour of every weekday passed.)
-        return now.weekday() < 5 and (9, 30) <= (now.hour, now.minute) < (16, 0)
+        """True during US regular session (source of truth: Alpaca clock)."""
+        try:
+            clock = self.client.get_clock()
+            return bool(getattr(clock, "is_open", False))
+        except Exception:
+            # Fallback: ET weekday/9:30-16:00 heuristic when the clock API
+            # is unreachable (offline tests, degraded network).
+            from datetime import timedelta, timezone
+            now = datetime.now(timezone(timedelta(hours=-5)))
+            return now.weekday() < 5 and (9, 30) <= (now.hour, now.minute) < (16, 0)
 
-    def trade(self, symbols, qty):
-        self._activity_guard()
+    # ---- positions ----
+    def sync_positions(self):
+        """Pull live Alpaca positions into the cache (source of truth)."""
+        cache = self._cache or TradeCache()
+        try:
+            positions = self.client.list_positions()
+        except Exception as e:
+            print(f"[broker] position sync failed: {type(e).__name__}: {e}")
+            return []
+        synced = []
+        for p in positions:
+            leg = {
+                "symbol": p.symbol,
+                "qty": int(float(p.qty)),
+                "avg_entry_px": float(p.avg_entry_price),
+                "current_px": float(p.current_price or 0),
+                "market_value": float(p.market_value or 0),
+                "unrealized_pl": float(p.unrealized_pl or 0),
+                "source": "alpaca",
+            }
+            cache.set_position(p.symbol, leg)
+            synced.append(leg)
+        # Drop cached legs that no longer exist at Alpaca (closed elsewhere).
+        live_symbols = {p.symbol for p in positions}
+        for cached in cache.all_positions():
+            if cached["symbol"] not in live_symbols:
+                cache.del_position(cached["symbol"])
+        return synced
+
+    # ---- orders ----
+    def trade(self, symbols, qty, side="buy"):
+        """Place market order(s). side is 'buy' or 'sell'; returns the
+        normalized response dict on acceptance, else None."""
         if qty <= 0:
             return None
-        # max_order_size_usd is a shares cap (despite the name); qty above it
-        # was previously silently rejected via `qty > max` — now clamp to the cap
-        # so a large signal doesn't zero the order.
-        qty = min(qty, float(self.config.max_order_size_usd))
         if symbols is None or len(symbols) == 0:
             return None
+        if side not in ("buy", "sell"):
+            raise ValueError(f"invalid side: {side!r}")
         if self.config.cache is None:
             self.init_cache(TradeCache())
-        
-        orders = {}
-        for s in symbols:
-            orders[s] = {
-                "order_type": "market",
-                "side": "buy", "qty": qty}
-        
+
+        orders = {
+            s: {"order_type": "market", "side": side, "qty": qty}
+            for s in symbols
+        }
         resp = self.mplace(self.config.order_mode, orders)
 
         # Alpaca REST returns Order objects, not dicts. Normalize to the
-        # dict shape trade() expects, preserving the order id when present.
+        # dict shape callers expect, preserving the order id when present.
         if resp is None or not hasattr(resp, "status"):
             resp = {"status": "ACCEPTED" if resp else "REJECTED",
+                    "side": side,
                     "orders": {s: {"id": str(resp) if resp else ""} for s in symbols},
                     "cost": None}
         else:
-            # Order object (or dict-like) from alpaca-trade-api
             status = getattr(resp, "status", "new") or "new"
             order_id = getattr(resp, "id", str(resp))
-            resp = {"status": "ACCEPTED" if status in ("new", "accepted", "ACCEPTED") else status,
+            resp = {"status": "ACCEPTED" if str(status).lower() in ("new", "accepted") else status,
+                    "side": side,
                     "orders": {s: {"id": str(order_id), "status": status} for s in symbols},
                     "cost": None}
 
@@ -82,10 +115,11 @@ class Broker:
             for s in symbols:
                 self._cache.record_trade({
                     "type": self.config.order_mode,
-                    "event": "TRADE", "ts": datetime.utcnow().isoformat(timespec="seconds"),
+                    "event": "TRADE",
+                    "ts": datetime.utcnow().isoformat(timespec="seconds"),
                     "acct": self.config.order_mode,
                     "order_id": resp["orders"][s]["id"],
-                    "qty": qty, "symbol": s,
+                    "side": side, "qty": qty, "symbol": s,
                     "cost": resp["orders"][s].get("cost"),
                     "avg_px": resp["orders"][s].get("avg_filled_px"),
                     "filled_qty": resp["orders"][s].get("filled_qty"),
@@ -94,9 +128,6 @@ class Broker:
                     "cum_qty": resp["orders"][s].get("filled_qty"),
                     "total": resp["cost"],
                     "status": resp["orders"][s].get("status"),
-                    "last_filled_qty": resp["orders"][s].get("filled_qty"),
-                    "last_filled_px": resp["orders"][s].get("filled_px"),
-                    "cost": resp["orders"][s].get("cost"),
                 })
             return resp
         print("FAILED order:", resp)
@@ -107,15 +138,9 @@ class Broker:
         if not orders or not isinstance(orders, dict):
             raise ValueError("Invalid orders structure")
 
-        # Paper/live is determined by the REST client's base_url (set from
-        # config at construction). Do NOT pass paper=True — alpaca-trade-api
-        # 3.x submit_order() has no such parameter.
-        # Paper/live is determined by the REST client's base_url (set from
-        # config at construction). Do NOT pass paper=True — alpaca-trade-api
-        # 3.x submit_order() has no such parameter.
         last_resp = None
         for symbol, order in orders.items():
-            last_resp = self.alpha_client.submit_order(
+            last_resp = self.client.submit_order(
                 symbol=symbol,
                 side=order.get("side", "buy"),
                 type=order.get("order_type", "market"),
@@ -123,8 +148,3 @@ class Broker:
                 time_in_force="day",
             )
         return last_resp
-
-    def _activity_guard(self):
-        if time.time() - self._last_activity > 120:
-            raise TimeoutError("broker activity timeout")
-        self._last_activity = time.time()

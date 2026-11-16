@@ -9,8 +9,7 @@ price/quote ticks. PAPER is the default. Set the order mode in `.env`.
 import argparse
 import asyncio
 
-from engine.bot import Bot
-from engine.bot import run_until_server_stop
+from engine.bot import Bot, run_until_server_stop
 from engine.config import BotConfig
 
 
