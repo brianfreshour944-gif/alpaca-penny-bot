@@ -23,8 +23,10 @@ class _FakePosition:
 
 
 class _FakeOrder:
-    def __init__(self):
-        self.id, self.status = "fake-order-1", "new"
+    def __init__(self, **kw):
+        self.id, self.status = kw.get("id", "fake-order-1"), kw.get("status", "new")
+        self.symbol = kw.get("symbol", "PENY")
+        self.side = kw.get("side", "buy")
 
 
 def _install_rest_stub():
@@ -320,3 +322,36 @@ def test_live_base_url_refused_without_allow_live(monkeypatch):
     monkeypatch.setenv("DEFAULT_ORDER_MODE", "paper")
     with pytest.raises(RuntimeError):
         BotConfig.load("/dev/null")
+
+
+def test_pending_new_order_not_double_bought():
+    """Regression: a buy that is still pending_new at Alpaca must not be
+    treated as closed by sync_positions(), which previously caused the bot
+    to place a duplicate market buy every loop until buying power ran out."""
+    _install_rest_stub()
+    from engine.bot import Bot
+    from engine.config import BotConfig
+
+    cfg = BotConfig(api_key="fake_key", secret_key="fake_secret",
+                    watchlist=["GRAB"], max_order_size_usd=25.0)
+    bot = Bot.load(cfg)
+    asyncio.run(bot.start())
+    # Seed GRAB bars so the entry gate passes, then neutralize REST polling.
+    bot.feed.poll_rest_bars = lambda s: None
+    for i in range(20):
+        bot.strategy.set_last_bar("GRAB", day=f"{(i % 28) + 1:02d}-01-2026",
+                                  ts=1e9 + i * 86400, close=3.0)
+    bot.strategy.cache.set_position("GRAB", {"symbol": "GRAB", "qty": 7,
+                                             "avg_entry_px": 3.0, "current_px": 3.0,
+                                             "order_id": "slow-1", "source": "bot"})
+    bot.broker.market_hours = lambda: True
+    # Simulate: order accepted (pending_new) but NOT yet a position.
+    bot.broker.client.list_positions = lambda: []
+    bot.broker.client.list_orders = lambda status="open": [
+        _FakeOrder(id="slow-1", status="pending_new", symbol="GRAB")]
+    bot.broker.client.submit_order = lambda **kw: bot.broker.client.submitted.append(kw)
+
+    bot.iteration()  # previously: sync deleted GRAB, then re-bought
+    assert bot.strategy.get_position_size("GRAB") == 7  # still held
+    assert bot.broker.client.submitted == []  # no duplicate order
+    asyncio.run(bot.stop())

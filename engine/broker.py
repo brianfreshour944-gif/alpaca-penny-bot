@@ -70,10 +70,19 @@ class Broker:
             }
             cache.set_position(p.symbol, leg)
             synced.append(leg)
-        # Drop cached legs that no longer exist at Alpaca (closed elsewhere).
+        # Symbols with an in-flight buy order at Alpaca are not positions
+        # yet (pending_new), but must not be treated as closed — otherwise
+        # every sync deletes the cached entry and the bot re-buys each loop.
+        try:
+            open_buy_symbols = {
+                o.symbol for o in self.client.list_orders(status="open")
+                if getattr(o, "side", "buy") == "buy"
+            }
+        except Exception:
+            open_buy_symbols = set()
         live_symbols = {p.symbol for p in positions}
         for cached in cache.all_positions():
-            if cached["symbol"] not in live_symbols:
+            if cached["symbol"] not in live_symbols and cached["symbol"] not in open_buy_symbols:
                 cache.del_position(cached["symbol"])
         return synced
 
