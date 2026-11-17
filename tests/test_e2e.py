@@ -346,7 +346,7 @@ def test_pending_new_order_not_double_bought():
                                              "order_id": "slow-1", "source": "bot"})
     bot.broker.market_hours = lambda: True
     # Simulate: order accepted (pending_new) but NOT yet a position.
-    bot.broker.client.list_positions = lambda: []
+    bot.broker.client.list_positions = list
     bot.broker.client.list_orders = lambda status="open": [
         _FakeOrder(id="slow-1", status="pending_new", symbol="GRAB")]
     bot.broker.client.submit_order = lambda **kw: bot.broker.client.submitted.append(kw)
