@@ -70,8 +70,23 @@ class BotConfig:
                 "ALPACA_API_KEY and ALPACA_SECRET_KEY (or PACA_* legacy names) "
                 "are not set. Check Coolify Environment Variables."
             )
+        # Paper-only guard: refuse to start against a live endpoint unless
+        # the operator explicitly opts in with ALLOW_LIVE=true. Also never
+        # let the paper label disagree with the configured endpoint.
         if config.base_url and not config.base_url.endswith("/"):
             config.base_url += "/"
+        is_paper_url = "paper-api.alpaca.markets" in config.base_url
+        allow_live = os.getenv("ALLOW_LIVE", "").strip().lower() == "true"
+        if not is_paper_url and not allow_live:
+            raise RuntimeError(
+                f"Refusing to start: base_url={config.base_url!r} is not the "
+                "paper endpoint. Set ALLOW_LIVE=true explicitly to trade live."
+            )
+        if config.order_mode == "paper" and not is_paper_url:
+            raise RuntimeError(
+                "order_mode=paper but base_url is not the paper endpoint — "
+                "labels and endpoint must agree."
+            )
         if config.order_mode not in ("paper", "live"):
             config.order_mode = "paper"
         # Mirror to PACA_* for any legacy code expecting those names.

@@ -8,6 +8,8 @@ import sys
 import types
 from datetime import UTC, datetime
 
+import pytest
+
 
 class _FakeClock:
     is_open = True
@@ -207,3 +209,114 @@ def test_entry_gate_needs_sma():
 
 if __name__ == "__main__":
     sys.exit(0)
+
+
+def test_sma_uses_newest_20_bars_across_months():
+    """(a) Bars spanning two months: SMA must use the 20 most recent bars
+    by timestamp, not by the %d-%m-%Y day string (which sorts by day first)."""
+    from engine.db import TradeCache
+
+    cache = TradeCache()
+    # 25 bars: 5 in Jan (ts early) + 20 in Dec (ts later, inserted first so
+    # insertion order is wrong too). Day strings like 05-01 sort BEFORE 20-12
+    # numerically even though Jan is later in real time.
+    for i in range(20):  # December, ts 1700000000..1700166400
+        ts = 1700000000 + i * 86400
+        day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
+        cache.set_last_bar("X", day=day, ts=ts, close=10.0)
+    for i in range(5):   # January (later), ts 1704000000..1704129600
+        ts = 1704000000 + i * 86400
+        day = datetime.fromtimestamp(ts).strftime("%d-%m-%Y")
+        cache.set_last_bar("X", day=day, ts=ts, close=50.0)
+    sma = cache.sma("X", 20)
+    # Newest 20 bars by ts = 15 Dec bars (10.0) + 5 Jan bars (50.0)
+    expected = (15 * 10.0 + 5 * 50.0) / 20
+    assert sma == expected, f"{sma} != {expected}"
+
+
+def test_get_last_bar_picks_newest_by_ts_out_of_order():
+    """(b) Insert bars out of order; get_last_bar/get_last_bar_full must
+    return the bar with the largest ts, not dict insertion order."""
+    from engine.db import TradeCache
+
+    cache = TradeCache()
+    late_ts = 1704100000.0
+    early_ts = 1700000000.0
+    cache.set_last_bar("Y", day="31-12-2023", ts=late_ts, close=111.0)
+    cache.set_last_bar("Y", day="14-11-2023", ts=early_ts, close=22.0)
+    # Inserted newest first; dict order would return 111.0 anyway. Now
+    # reverse: insert oldest last and confirm the newest still wins.
+    cache2 = TradeCache()
+    cache2.set_last_bar("Y", day="14-11-2023", ts=early_ts, close=22.0)
+    cache2.set_last_bar("Y", day="31-12-2023", ts=late_ts, close=111.0)
+    assert cache2.get_last_bar("Y") == 111.0
+    full = cache2.get_last_bar_full("Y")
+    assert full["close"] == 111.0 and full["ts"] == late_ts
+    assert cache.get_last_bar("Y") == 111.0
+
+
+def test_stock_above_budget_returns_zero_and_no_order():
+    """(c) Price above max_order_size_usd -> qty 0, no order placed."""
+    _install_rest_stub()
+    from engine.bot import Bot
+    from engine.config import BotConfig
+
+    cfg = BotConfig(api_key="fake_key", secret_key="fake_secret",
+                    watchlist=["PENY"], max_order_size_usd=25.0)
+    bot = Bot.load(cfg)
+    asyncio.run(bot.start())
+    bot.feed.poll_rest_bars = lambda s: False
+    # Overwrite the last bar with a price above the $25 budget.
+    days = bot.feed._bars["PENY"]
+    last_day = max(days, key=lambda d: days[d][1])
+    close, ts = days[last_day]
+    days[last_day] = (round(close * 100, 4), ts)  # ~$239 > $25 budget
+    bot.strategy.update_last_bar(["PENY"], feed=bot.feed)
+    s = bot.iteration()
+    assert s["entries"] == []
+    assert bot.broker.client.submitted == [], "must not order above budget"
+
+
+def test_stock_below_budget_gets_floor_shares():
+    """(d) Price below budget -> floor(budget / price) shares."""
+    _install_rest_stub()
+    from engine.bot import Bot
+    from engine.config import BotConfig
+
+    cfg = BotConfig(api_key="fake_key", secret_key="fake_secret",
+                    watchlist=["PENY"], max_order_size_usd=25.0)
+    bot = Bot.load(cfg)
+    asyncio.run(bot.start())
+    bot.feed.poll_rest_bars = lambda s: False
+    # Last close ~2.39 -> floor(25 / 2.39) = 10 shares.
+    qty = bot.strategy.quantity_for("PENY")
+    close = bot.strategy.last_close("PENY")
+    assert qty == int(25.0 / close), f"{qty} != floor(25/{close})"
+    assert qty == 10
+
+
+def test_live_base_url_refused_without_allow_live(monkeypatch):
+    """(e) Live base_url raises RuntimeError unless ALLOW_LIVE=true."""
+    _install_rest_stub()
+    from engine.config import BotConfig
+
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.delenv("ALLOW_LIVE", raising=False)
+    monkeypatch.delenv("PACA_BASE_URL", raising=False)
+
+    # Live endpoint, no opt-in -> refused.
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    with pytest.raises(RuntimeError):
+        BotConfig.load("/dev/null")
+
+    # Explicit opt-in + live order mode -> allowed.
+    monkeypatch.setenv("ALLOW_LIVE", "true")
+    monkeypatch.setenv("DEFAULT_ORDER_MODE", "live")
+    cfg = BotConfig.load("/dev/null")
+    assert "api.alpaca.markets" in cfg.base_url
+
+    # paper label + live endpoint -> refused even with the opt-in.
+    monkeypatch.setenv("DEFAULT_ORDER_MODE", "paper")
+    with pytest.raises(RuntimeError):
+        BotConfig.load("/dev/null")

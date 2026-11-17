@@ -67,15 +67,18 @@ class Strategy:
 
     # ---- sizing ----
     def quantity_for(self, symbol: str):
-        """Shares per symbol: floor(max_order_size_usd / close), min 1,
-        capped by max_position_qty. Falls back to 1 when no price is known."""
+        """Shares per symbol: floor(max_order_size_usd / close), capped by
+        max_position_qty. Returns 0 when no price is known or one share would
+        exceed the budget, so the symbol is skipped instead of overspending."""
         close = self.last_close(symbol)
         cap = int(getattr(self.config, "max_position_qty", 1000))
         if not close or close <= 0:
-            return 1
+            return 0
         budget = float(getattr(self.config, "max_order_size_usd", 25.0))
         qty = math.floor(budget / close)
-        return max(1, min(qty, cap))
+        if qty <= 0:
+            return 0
+        return min(qty, cap)
 
     def next_order_qty(self, symbol: str, qty: int):
         return qty
@@ -101,7 +104,13 @@ class Strategy:
         """
         if not self.should_enter(symbol):
             return 0
-        return self.quantity_for(symbol)
+        qty = self.quantity_for(symbol)
+        if qty <= 0:
+            close = self.last_close(symbol) or 0.0
+            budget = float(getattr(self.config, "max_order_size_usd", 25.0))
+            print(f"[strategy] skip {symbol}: price {close} exceeds "
+                  f"max order size {budget}")
+        return qty
 
     # ---- exits ----
     def check_exit(self, symbol: str):

@@ -98,27 +98,32 @@ class TradeCache:
             self._bars.setdefault(symbol, {})[day] = (float(close), float(ts))
 
     def get_last_bar(self, symbol: str):
-        """Latest close price for the symbol, or None."""
+        """Latest close price for the symbol (largest ts), or None."""
         days = self._bars.get(symbol)
         if not days:
             return None
-        return list(days.values())[-1][0]
+        return max(days.values(), key=lambda bar: bar[1])[0]
 
     def get_last_bar_full(self, symbol: str):
-        """Latest bar as {'close': float, 'ts': float, 'day': str}, or None."""
+        """Latest bar (largest ts) as {'close', 'ts', 'day'}, or None."""
         days = self._bars.get(symbol)
         if not days:
             return None
-        day = list(days.keys())[-1]
-        close, ts = days[day]
+        # Day strings sort by day-of-month first (%d-%m-%Y); pick by ts.
+        day, (close, ts) = max(days.items(), key=lambda kv: kv[1][1])
         return {"day": day, "ts": ts, "close": close}
 
     def sma(self, symbol: str, window: int = 20):
-        """Simple moving average of the most recent `window` closes, or None."""
+        """Simple moving average of the most recent `window` closes, or None.
+
+        Ordered by bar timestamp, not the %d-%m-%Y day string (which sorts
+        day-of-month first and scrambles history across month boundaries).
+        """
         days = self._bars.get(symbol)
         if not days:
             return None
-        closes = [c for _, (c, _) in sorted(days.items())][-window:]
+        closes = [c for _, (c, _) in
+                  sorted(days.items(), key=lambda kv: kv[1][1])][-window:]
         if len(closes) < window:
             return None
         return sum(closes) / len(closes)
